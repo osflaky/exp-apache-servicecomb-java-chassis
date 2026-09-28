@@ -1,0 +1,216 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.servicecomb.config.center.client;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpStatus;
+import org.apache.servicecomb.config.common.exception.OperationException;
+import org.apache.servicecomb.config.center.client.model.QueryConfigurationsRequest;
+import org.apache.servicecomb.config.center.client.model.QueryConfigurationsResponse;
+import org.apache.servicecomb.http.client.common.HttpRequest;
+import org.apache.servicecomb.http.client.common.HttpResponse;
+import org.apache.servicecomb.http.client.common.HttpTransport;
+import org.apache.servicecomb.http.client.common.HttpUtils;
+import org.apache.servicecomb.http.client.event.OperationEvents.UnAuthorizedOperationEvent;
+import org.apache.servicecomb.http.client.utils.ServiceCombServiceAvailableUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.util.CollectionUtils;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.common.eventbus.EventBus;
+
+public class ConfigCenterClient implements ConfigCenterOperation {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ConfigCenterClient.class);
+
+  public static final String DEFAULT_APP_SEPARATOR = "@";
+
+  public static final String DEFAULT_SERVICE_SEPARATOR = "#";
+
+  public static final String REVISION = "revision";
+
+  public static final String APPLICATION_CONFIG = "application";
+
+  public static final String DARK_LAUNCH = "darklaunch@";
+
+  private static final String ADDRESS_CHECK_PATH = "/v3/default/configuration/health?mode=readiness";
+
+  private final HttpTransport httpTransport;
+
+  private final ConfigCenterAddressManager addressManager;
+
+  private final Map<String, List<String>> dimensionConfigNames = new HashMap<>();
+
+  private EventBus eventBus;
+
+  public ConfigCenterClient(ConfigCenterAddressManager addressManager, HttpTransport httpTransport) {
+    this.addressManager = addressManager;
+    this.httpTransport = httpTransport;
+  }
+
+  public void setEventBus(EventBus eventBus) {
+    this.eventBus = eventBus;
+    addressManager.setEventBus(eventBus);
+  }
+
+  @Override
+  public QueryConfigurationsResponse queryConfigurations(QueryConfigurationsRequest request, String address) {
+    String dimensionsInfo = buildDimensionsInfo(request, true);
+    QueryConfigurationsResponse queryConfigurationsResponse = new QueryConfigurationsResponse();
+
+    Map<String, Object> configurations = new HashMap<>();
+
+    String uri = null;
+    try {
+      uri = address + "/configuration/items?dimensionsInfo="
+          + HttpUtils.encodeURLParam(dimensionsInfo) + "&revision=" + request.getRevision();
+
+      Map<String, String> headers = new HashMap<>();
+      headers.put("x-environment", request.getEnvironment());
+      HttpRequest httpRequest = new HttpRequest(uri, headers, null,
+          HttpRequest.GET);
+
+      HttpResponse httpResponse = httpTransport.doRequest(httpRequest);
+      recordAndSendUnAuthorizedEvent(httpResponse, address);
+      if (httpResponse.getStatusCode() == HttpStatus.SC_OK) {
+        Map<String, Map<String, Object>> allConfigMap = HttpUtils.deserialize(
+            httpResponse.getContent(),
+            new TypeReference<Map<String, Map<String, Object>>>() {
+            });
+
+        if (allConfigMap.get(REVISION) != null) {
+          queryConfigurationsResponse.setRevision((String) allConfigMap.get(REVISION).get("version"));
+        }
+
+        if (allConfigMap.get(APPLICATION_CONFIG) != null) {
+          configurations.putAll(allConfigMap.get(APPLICATION_CONFIG));
+          logConfigurationNames(APPLICATION_CONFIG, allConfigMap.get(APPLICATION_CONFIG));
+        }
+
+        if (allConfigMap.get(buildDimensionsInfo(request, false)) != null) {
+          configurations.putAll(allConfigMap.get(buildDimensionsInfo(request, false)));
+          logConfigurationNames(buildDimensionsInfo(request, false),
+              allConfigMap.get(buildDimensionsInfo(request, false)));
+        }
+
+        if (allConfigMap.get(buildDarkLaunchDimensionsInfo(request)) != null) {
+          configurations.putAll(allConfigMap.get(buildDarkLaunchDimensionsInfo(request)));
+          logConfigurationNames(buildDarkLaunchDimensionsInfo(request),
+              allConfigMap.get(buildDarkLaunchDimensionsInfo(request)));
+        }
+
+        if (allConfigMap.get(dimensionsInfo) != null) {
+          configurations.putAll(allConfigMap.get(dimensionsInfo));
+          logConfigurationNames(dimensionsInfo, allConfigMap.get(dimensionsInfo));
+        }
+        queryConfigurationsResponse.setConfigurations(configurations);
+        queryConfigurationsResponse.setChanged(true);
+        return queryConfigurationsResponse;
+      } else if (httpResponse.getStatusCode() == HttpStatus.SC_NOT_MODIFIED) {
+        queryConfigurationsResponse.setChanged(false);
+        return queryConfigurationsResponse;
+      } else if (httpResponse.getStatusCode() == HttpStatus.SC_TOO_MANY_REQUESTS) {
+        LOGGER.warn("rate limited, keep the local dimension [{}] configs unchanged.", dimensionsInfo);
+        queryConfigurationsResponse.setChanged(false);
+        return queryConfigurationsResponse;
+      } else if (httpResponse.getStatusCode() == HttpStatus.SC_BAD_REQUEST) {
+        throw new OperationException("Bad request for query configurations.");
+      } else {
+        throw new OperationException(
+            "read response failed. status:"
+                + httpResponse.getStatusCode()
+                + "; message:"
+                + httpResponse.getMessage()
+                + "; content:"
+                + httpResponse.getContent());
+      }
+    } catch (IOException e) {
+      addressManager.recordFailState(address);
+      LOGGER.error("query configuration from {} failed, message={}", uri, e.getMessage());
+      throw new OperationException("", e);
+    }
+  }
+
+  private void recordAndSendUnAuthorizedEvent(HttpResponse response, String address) {
+    if (this.eventBus != null && response.getStatusCode() == HttpStatus.SC_UNAUTHORIZED) {
+      LOGGER.warn("query configuration unauthorized from server [{}], message [{}]", address, response.getMessage());
+      addressManager.recordFailState(address);
+      this.eventBus.post(new UnAuthorizedOperationEvent(address));
+    } else {
+      addressManager.recordSuccessState(address);
+    }
+  }
+
+  /**
+   * Only the name of the new configuration item is printed.
+   * No log is printed when the configuration content is updated.
+   *
+   * @param dimension dimension
+   * @param configs configs
+   */
+  private void logConfigurationNames(String dimension, Map<String, Object> configs) {
+    if (CollectionUtils.isEmpty(configs)) {
+      return;
+    }
+    List<String> configNames = dimensionConfigNames.get(dimension);
+    if (configNames == null) {
+      configNames = new ArrayList<>();
+    }
+    StringBuilder names = new StringBuilder();
+    for (String key : configs.keySet()) {
+      if (configNames.contains(key)) {
+        continue;
+      }
+      names.append(key).append(",");
+      configNames.add(key);
+    }
+    if (names.isEmpty()) {
+      return;
+    }
+    dimensionConfigNames.put(dimension, configNames);
+    String fileNames = names.substring(0, names.length() - 1);
+    LOGGER.info("pulling dimension [{}] configurations success, get config names: [{}].",
+        dimension, fileNames);
+  }
+
+  @Override
+  public void checkAddressAvailable(String address) {
+    ServiceCombServiceAvailableUtils.checkAddressAvailable(addressManager, address, httpTransport, ADDRESS_CHECK_PATH);
+  }
+
+  private String buildDimensionsInfo(QueryConfigurationsRequest request, boolean withVersion) {
+    String result =
+        request.getServiceName() + DEFAULT_APP_SEPARATOR
+            + request.getApplication();
+    if (withVersion && !StringUtils.isEmpty(request.getVersion())) {
+      result = result + DEFAULT_SERVICE_SEPARATOR + request
+          .getVersion();
+    }
+    return result;
+  }
+
+  private String buildDarkLaunchDimensionsInfo(QueryConfigurationsRequest request) {
+    return DARK_LAUNCH + request.getApplication();
+  }
+}
